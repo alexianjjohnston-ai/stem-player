@@ -3,176 +3,381 @@
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>Stem Player</title>
 <style>
-  body{margin:0;min-height:100vh;display:grid;place-items:center;background:#000;color:#aaa;font:13px system-ui;touch-action:none}
-  main{text-align:center}
-  svg{width:min(90vw,70vh);display:block;margin:auto;user-select:none;-webkit-user-select:none}
-  label{display:inline-block;margin-top:14px;padding:8px 14px;border:1px solid #444;border-radius:99px;cursor:pointer}
-  input{display:none}
+  :root{--bg:#07070a;--card:#121217;--line:#26262e;--fg:#ececf1;--dim:#8b8b97}
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px 16px;background:radial-gradient(1100px 650px at 50% -10%,#1b1b27,var(--bg));color:var(--fg);font:14px/1.4 system-ui,-apple-system,sans-serif}
+  main{width:min(460px,100%);display:grid;gap:18px}
+  h1{margin:0;font-size:12px;letter-spacing:.32em;font-weight:600;color:var(--dim);text-align:center}
+  svg{width:100%;display:block;user-select:none;-webkit-user-select:none;touch-action:none}
+  .glow{filter:blur(7px)}
+  .tr{display:flex;align-items:center;gap:10px;color:var(--dim);font-variant-numeric:tabular-nums;font-size:12px}
+  input[type=range]{flex:1;accent-color:#fff;height:18px;margin:0}
+  #modes{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  #modes button{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:12px;padding:10px 12px;text-align:left;cursor:pointer;font:inherit}
+  #modes button:hover:not(:disabled){border-color:#55555f}
+  #modes button[aria-pressed=true]{border-color:#fff;background:#1c1c24}
+  #modes button:disabled{opacity:.4;cursor:not-allowed}
+  #modes b{display:flex;justify-content:space-between;align-items:center}
+  #modes small{display:block;color:var(--dim);font-size:12px;margin-top:2px}
+  .tag{font-size:10px;font-weight:500;letter-spacing:.04em;color:#38d996}
+  .tag.dl{color:var(--dim)}
+  #pick{display:block;text-align:center;padding:13px;border-radius:12px;background:#fff;color:#000;font-weight:600;cursor:pointer}
+  #pick.busy{opacity:.4;pointer-events:none}
+  #pick input{display:none}
+  #bar{height:4px;border-radius:4px;background:var(--line);overflow:hidden}
+  #bar i{display:block;height:100%;width:0;background:#fff;transition:width .2s}
+  #msg{margin:0;text-align:center;color:var(--dim);font-size:13px;min-height:1.4em}
+  body.drag main{outline:2px dashed #fff;outline-offset:12px;border-radius:16px}
 </style>
 <main>
+  <h1>STEM PLAYER</h1>
   <svg id=s viewBox="0 0 400 400"></svg>
-  <label>split a song<input id=f type=file accept="audio/*"></label>
-  <p id=msg>demo stems loaded &middot; drag along each arc to set its level &middot; tap centre to play</p>
+  <div class=tr><span id=cur>0:00</span><input id=seek type=range min=0 max=1 step=.01 value=0><span id=tot>0:00</span></div>
+  <div id=modes></div>
+  <label id=pick>Choose a song to split<input id=f type=file accept="audio/*"></label>
+  <div id=bar><i></i></div>
+  <p id=msg></p>
 </main>
 <script type=module>
 import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.webgpu.min.mjs';
-import { DemucsProcessor, CONSTANTS, prepareModelInput, standaloneMask, standaloneIspec } from 'https://cdn.jsdelivr.net/npm/demucs-web@1.0.2/src/index.js';
+import { CONSTANTS, prepareModelInput, standaloneMask, standaloneIspec } from 'https://cdn.jsdelivr.net/npm/demucs-web@1.0.2/src/index.js';
 ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
-const NS = 'http://www.w3.org/2000/svg', ctx = new AudioContext({ sampleRate: CONSTANTS.SAMPLE_RATE }); // demucs wants 44.1k
-const names = ['drums', 'bass', 'samples', 'vocals'], vol = [1, 1, 1, 1];
-let gains = [], srcs = [];
+ort.env.logLevel = 'error';
 
-// ---- demo stems (4 bars @ 96bpm), so it works with no files ----
-function synth() {
-  const sr = ctx.sampleRate, beat = .625, N = Math.round(sr * beat * 16);
+const SR = CONSTANTS.SAMPLE_RATE, T = CONSTANTS.TRAINING_SAMPLES;
+const ctx = new AudioContext({ sampleRate: SR }); // demucs wants 44.1k
+const $ = id => document.getElementById(id);
+const NAMES = ['drums', 'bass', 'samples', 'vocals'], STEMS = ['drums', 'bass', 'other', 'vocals']; // model order
+const COL = ['#ff6a3d', '#3d8bff', '#38d996', '#ff4fa3'];
+const vol = [1, 1, 1, 1];
+const fmt = t => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, '0')}`;
+const say = (t, frac) => { $('msg').textContent = t; if (frac != null) $('bar').firstChild.style.width = (frac * 100) + '%'; };
+
+// ================= audio graph / transport =================
+const gains = [], analysers = [];
+for (let i = 0; i < 4; i++) {
+  const g = ctx.createGain(), a = ctx.createAnalyser();
+  a.fftSize = 512; g.connect(a).connect(ctx.destination);
+  gains.push(g); analysers.push(a);
+}
+let buffers = [], srcs = [], dur = 0, t0 = 0;
+const pos = () => dur ? (((ctx.currentTime - t0) % dur) + dur) % dur : 0;
+
+function start(off) { // (re)start all stems in sync from `off` seconds
+  srcs.forEach(s => { try { s.stop(); } catch {} });
+  srcs = buffers.map((b, i) => {
+    const s = ctx.createBufferSource();
+    s.buffer = b; s.loop = true; s.connect(gains[i]); s.start(0, off);
+    return s;
+  });
+  t0 = ctx.currentTime - off;
+}
+function setStems(bufs) {
+  buffers = bufs; dur = bufs[0].duration;
+  seek.max = dur; $('tot').textContent = fmt(dur);
+  start(0);
+}
+const toggle = () => ctx.state == 'running' ? ctx.suspend() : ctx.resume();
+
+// ================= demo stems (4 bars @ 96bpm) =================
+function demo() {
+  const beat = .625, N = Math.round(SR * beat * 16);
   const d = [0, 1, 2, 3].map(() => new Float32Array(N));
-  const put = (a, at, dur, f) => { const i0 = Math.round(at * sr); for (let j = 0; j < dur * sr && i0 + j < N; j++) a[i0 + j] += f(j / sr) * (1 - j / sr / dur); };
+  const put = (a, at, len, f) => { const i0 = Math.round(at * SR); for (let j = 0; j < len * SR && i0 + j < N; j++) a[i0 + j] += f(j / SR) * (1 - j / SR / len); };
   const sin = (f, t) => Math.sin(2 * Math.PI * f * t), noise = () => Math.random() * 2 - 1;
   const bass = [55, 43.65, 65.41, 49], chords = [[220, 261.6, 329.6], [174.6, 220, 261.6], [261.6, 329.6, 392], [196, 246.9, 293.7]];
   const scale = [440, 523.25, 587.33, 659.25, 783.99], lead = '0-2-4-3-2---0-2-4-3-2-0-1---3-2-';
   for (let b = 0; b < 16; b++) {
     const t = b * beat;
-    if (b % 2) put(d[0], t, .2, () => noise() * .5); else put(d[0], t, .3, x => Math.sin(2 * Math.PI * (45 * x + 3 * (1 - Math.exp(-30 * x)) * 30)) * .9);
+    if (b % 2) put(d[0], t, .2, () => noise() * .5); else put(d[0], t, .3, x => Math.sin(2 * Math.PI * (45 * x + 90 * (1 - Math.exp(-30 * x)))) * .9);
     put(d[0], t, .05, () => noise() * .2); put(d[0], t + beat / 2, .05, () => noise() * .2);
     put(d[1], t, beat * .9, x => (sin(bass[b >> 2], x) + .3 * sin(2 * bass[b >> 2], x)) * .6);
   }
   for (let bar = 0; bar < 4; bar++) chords[bar].forEach(f => put(d[2], bar * 4 * beat, 4 * beat, x => sin(f, x) * .12));
   [...lead].forEach((c, i) => c != '-' && put(d[3], i * beat / 2, beat, x => sin(scale[c], x) * .3));
-  return d.map(a => { const b = ctx.createBuffer(1, N, sr); b.copyToChannel(a, 0); return b; });
+  return d.map(a => { const b = ctx.createBuffer(1, N, SR); b.copyToChannel(a, 0); return b; });
 }
 
-function setStems(bufs) {
-  srcs.forEach(s => s.stop());
-  gains = bufs.map((b, i) => {
-    const g = ctx.createGain(), s = ctx.createBufferSource();
-    g.gain.value = vol[i]; s.buffer = b; s.loop = true; s.connect(g).connect(ctx.destination); s.start();
-    srcs[i] = s; return g;
-  });
-}
-
-// ---- UI ----
-const s = document.getElementById('s');
+// ================= device UI =================
+const NS = 'http://www.w3.org/2000/svg', s = $('s'), seek = $('seek');
 const el = (t, a, p = s) => { const e = document.createElementNS(NS, t); for (const k in a) e.setAttribute(k, a[k]); p.append(e); return e; };
 const P = (r, a) => { a = (a - 90) * Math.PI / 180; return (200 + r * Math.cos(a)).toFixed(1) + ' ' + (200 + r * Math.sin(a)).toFixed(1); };
 const arc = (a0, a1) => `M${P(150, a0)}A150 150 0 0 1 ${P(150, a1)}`;
-const SW = 80, GAP = 5; // each stem arc spans 80deg of its 90deg quadrant
+const SW = 80, GAP = 5; // each stem's arc spans 80deg of its 90deg quadrant
 
-el('circle', { cx: 200, cy: 200, r: 198, fill: '#111' });
-const fills = names.map((n, i) => {
-  el('path', { d: arc(i * 90 + GAP, i * 90 + GAP + SW), stroke: '#2a2a2a', 'stroke-width': 34, fill: 'none' });
-  const fill = el('path', { stroke: '#fff', 'stroke-width': 34, fill: 'none' });
+el('circle', { cx: 200, cy: 200, r: 198, fill: '#0e0e13', stroke: '#1d1d26', 'stroke-width': 2 });
+const ui = NAMES.map((n, i) => {
+  const d = arc(i * 90 + GAP, i * 90 + GAP + SW), W = { fill: 'none', 'stroke-width': 34 };
+  el('path', { d, stroke: COL[i], opacity: .16, ...W });
+  const glow = el('path', { stroke: COL[i], class: 'glow', ...W });
+  const fill = el('path', { stroke: COL[i], ...W });
   const [x, y] = P(100, i * 90 + 45).split(' ');
-  el('text', { x, y, fill: '#777', 'font-size': 11, 'text-anchor': 'middle', 'dominant-baseline': 'middle' }).textContent = n;
-  return fill;
+  const T = { x, 'text-anchor': 'middle', 'dominant-baseline': 'middle', style: 'pointer-events:none' };
+  el('text', { ...T, y: +y - 7, fill: COL[i], 'font-size': 11, 'font-weight': 600 }).textContent = n;
+  const pct = el('text', { ...T, y: +y + 8, fill: '#8b8b97', 'font-size': 11 });
+  return { fill, glow, pct };
 });
-const label = i => fills[i].nextSibling;
-const draw = i => fills[i].setAttribute('d', vol[i] > 0 ? arc(i * 90 + GAP, i * 90 + GAP + SW * vol[i]) : '');
-names.forEach((_, i) => draw(i));
+const draw = i => {
+  const d = vol[i] > 0 ? arc(i * 90 + GAP, i * 90 + GAP + SW * vol[i]) : '';
+  ui[i].fill.setAttribute('d', d); ui[i].glow.setAttribute('d', d);
+  ui[i].pct.textContent = Math.round(vol[i] * 100) + '%';
+};
+NAMES.forEach((_, i) => draw(i));
 
-const btn = el('circle', { cx: 200, cy: 200, r: 50, fill: '#222', style: 'cursor:pointer' });
+el('circle', { cx: 200, cy: 200, r: 52, fill: '#1b1b23', stroke: '#2a2a35', 'stroke-width': 2, style: 'cursor:pointer' });
 const icon = el('path', { fill: '#fff', style: 'pointer-events:none' });
-const showIcon = () => icon.setAttribute('d', ctx.state == 'running' ? 'M186 182h10v36h-10zM204 182h10v36h-10z' : 'M188 180l28 20-28 20z');
+const showIcon = () => icon.setAttribute('d', ctx.state == 'running' ? 'M186 182h10v36h-10zM204 182h10v36h-10z' : 'M189 180l28 20-28 20z');
+ctx.onstatechange = showIcon;
+if (ctx.state == 'running') ctx.suspend(); // wait for a tap
 showIcon();
-btn.onclick = async () => { await (ctx.state == 'running' ? ctx.suspend() : ctx.resume()); showIcon(); };
 
+// pointer: centre = play/pause, ring = drag a stem's level (locked to the arc you grabbed)
 let lock = -1;
 const pt = e => { const r = s.getBoundingClientRect(); return [(e.clientX - r.left) / r.width * 400 - 200, (e.clientY - r.top) / r.height * 400 - 200]; };
-const set = e => {
+const setVol = e => {
   const [x, y] = pt(e), t = (Math.atan2(y, x) * 180 / Math.PI + 450) % 360; // deg clockwise from top
-  if (lock < 0) { if (Math.hypot(x, y) < 95) return; lock = Math.floor(t / 90); }
-  const rel = ((t - lock * 90 - GAP + 540) % 360) - 180; // wrap so dragging past the ends clamps
+  if (lock < 0) lock = Math.floor(t / 90);
+  const rel = ((t - lock * 90 - GAP + 540) % 360) - 180; // wraps, so dragging past an end clamps
   vol[lock] = Math.min(1, Math.max(0, rel / SW));
-  gains[lock]?.gain.setTargetAtTime(vol[lock], ctx.currentTime, .02);
+  gains[lock].gain.setTargetAtTime(vol[lock], ctx.currentTime, .02);
   draw(lock);
 };
-s.onpointerdown = e => { s.setPointerCapture(e.pointerId); set(e); };
-s.onpointermove = e => lock >= 0 && set(e);
+s.onpointerdown = e => {
+  const [x, y] = pt(e), r = Math.hypot(x, y);
+  if (r < 70) return toggle();
+  if (r < 100) return;
+  s.setPointerCapture(e.pointerId); setVol(e);
+};
+s.onpointermove = e => lock >= 0 && setVol(e);
 s.onpointerup = s.onpointercancel = () => lock = -1;
+addEventListener('keydown', e => { if (e.code == 'Space' && !/INPUT|BUTTON/.test(e.target.tagName)) { e.preventDefault(); toggle(); } });
 
-// ---- split a song into stems in-browser (Demucs via onnxruntime-web) ----
-const STEMS = ['drums', 'bass', 'other', 'vocals'], say = t => msg.textContent = t;
-const T = CONSTANTS.TRAINING_SAMPLES;
+let seeking = false;
+seek.oninput = () => { seeking = true; $('cur').textContent = fmt(+seek.value); };
+seek.onchange = () => { seeking = false; if (dur) start(+seek.value); };
 
-// High quality: htdemucs_ft = 4 specialist models, stem k taken from model k. Needs WebGPU (fp16 weights).
-// The 16 CPU-pinned nodes (fp16-overflowing normalisation) come from the model author's ft_cpu_nodes.json; same for every stem.
-const FT_URL = s => `https://huggingface.co/monteslu/htdemucs-ft-webgpu/resolve/main/htdemucs_ft_${s}_safe16.onnx`;
-const CPU_NODES = ['/ReduceMean', '/Sub', '/Pow', '/ReduceMean_1', '/Clip', '/Sqrt', '/Add', '/Div', '/ReduceMean_2', '/Sub_1', '/Pow_1', '/ReduceMean_3', '/Clip_1', '/Sqrt_1', '/Add_1', '/Div_1'];
-let ft, base;
+const buf = new Float32Array(analysers[0].fftSize), lvl = [0, 0, 0, 0];
+(function frame() {
+  if (dur && !seeking) { const p = pos(); seek.value = p; $('cur').textContent = fmt(p); }
+  analysers.forEach((a, i) => {
+    a.getFloatTimeDomainData(buf);
+    let sum = 0; for (const v of buf) sum += v * v;
+    lvl[i] = Math.max(Math.sqrt(sum / buf.length) * 5, lvl[i] * .9); // fast attack, slow release
+    ui[i].glow.style.opacity = ctx.state == 'running' ? Math.min(1, .1 + lvl[i]) : 0;
+  });
+  requestAnimationFrame(frame);
+})();
 
-async function splitFT(L, R) {
-  if (!ft) { // sessions must be created one at a time
-    ft = [];
-    for (const s of STEMS) {
-      say(`downloading ${s} model (${ft.length + 1}/4, ~84MB each)`);
-      const buf = new Uint8Array(await (await fetch(FT_URL(s))).arrayBuffer());
-      ft.push(await ort.InferenceSession.create(buf, { executionProviders: [{ name: 'webgpu', forceCpuNodeNames: CPU_NODES }], graphOptimizationLevel: 'all' }));
-    }
+// ================= model cache =================
+// Models live in the browser's Cache API, so they download once.
+async function fetchModel(url, label, frac0 = 0, frac1 = 1) {
+  let c; try { c = await caches.open('stem-models'); const hit = await c.match(url); if (hit) return new Uint8Array(await hit.arrayBuffer()); } catch {}
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`model download failed (${r.status})`);
+  const total = +r.headers.get('content-length') || 0, rd = r.body.getReader(), parts = [];
+  for (let got = 0; ;) {
+    const { done, value } = await rd.read();
+    if (done) break;
+    parts.push(value); got += value.length;
+    say(`downloading ${label}${total ? ' · ' + (got / total * 100).toFixed(0) + '%' : ' · ' + (got / 1e6).toFixed(0) + ' MB'} (one time only)`, total ? frac0 + got / total * (frac1 - frac0) : null);
   }
-  const n = L.length, stride = Math.floor(T * .75), starts = [];
-  for (let s = 0; ; s += stride) { if (s + T >= n) { starts.push(Math.max(0, n - T)); break; } starts.push(s); }
+  const blob = new Blob(parts);
+  try { await c?.put(url, new Response(blob)); navigator.storage?.persist?.(); } catch {} // storage full/private mode: just skip caching
+  return new Uint8Array(await blob.arrayBuffer());
+}
+const isCached = async urls => { try { const c = await caches.open('stem-models'); return (await Promise.all(urls.map(u => c.match(u)))).every(Boolean); } catch { return false; } };
+
+// ================= ML split (Demucs via onnxruntime-web) =================
+const gpu = !!navigator.gpu && !!(await navigator.gpu.requestAdapter().catch(() => 0));
+const BASE_URL = CONSTANTS.DEFAULT_MODEL_URL;
+const FT_URL = k => `https://huggingface.co/monteslu/htdemucs-ft-webgpu/resolve/main/htdemucs_ft_${k}_safe16.onnx`;
+// fp16-overflowing normalisation nodes pinned to CPU (from the model author's ft_cpu_nodes.json; same for every stem)
+const CPU_NODES = ['/ReduceMean', '/Sub', '/Pow', '/ReduceMean_1', '/Clip', '/Sqrt', '/Add', '/Div', '/ReduceMean_2', '/Sub_1', '/Pow_1', '/ReduceMean_3', '/Clip_1', '/Sqrt_1', '/Add_1', '/Div_1'];
+const sessions = {};
+
+async function getSessions(ft) {
+  const key = ft ? 'ft' : 'base';
+  if (sessions[key]) return sessions[key];
+  const out = [];
+  if (ft) { // ORT-web can't create WebGPU sessions concurrently
+    for (const [i, k] of STEMS.entries()) {
+      const b = await fetchModel(FT_URL(k), `${k} model ${i + 1}/4`, i / 4, (i + 1) / 4);
+      say(`loading ${k} model…`);
+      out.push(await ort.InferenceSession.create(b, { executionProviders: [{ name: 'webgpu', forceCpuNodeNames: CPU_NODES }], graphOptimizationLevel: 'all' }));
+    }
+  } else {
+    const b = await fetchModel(BASE_URL, 'standard model');
+    say('loading model…');
+    out.push(await ort.InferenceSession.create(b, { executionProviders: gpu ? ['webgpu', 'wasm'] : ['wasm'], graphOptimizationLevel: 'basic' }));
+  }
+  return sessions[key] = out;
+}
+
+// ft: 4 specialist sessions, stem k from session k. Otherwise one session yields all 4 stems.
+async function mlSplit({ ft, overlap }, L, R) {
+  const sess = await getSessions(ft);
+  const n = L.length, stride = Math.floor(T * (1 - overlap)), fade = T - stride, starts = [];
+  for (let st = 0; ; st += stride) { if (st + T >= n) { starts.push(Math.max(0, n - T)); break; } starts.push(st); }
   const out = STEMS.map(() => ({ left: new Float32Array(n), right: new Float32Array(n) })), w = new Float32Array(n);
-  const sl = new Float32Array(T), sr = new Float32Array(T);
-  for (const [si, start] of starts.entries()) {
-    const len = Math.min(start + T, n) - start;
-    sl.fill(0); sr.fill(0); sl.set(L.subarray(start, start + len)); sr.set(R.subarray(start, start + len));
+  const sl = new Float32Array(T), sr = new Float32Array(T), t0 = performance.now();
+  for (const [si, st] of starts.entries()) {
+    const len = Math.min(st + T, n) - st, last = si == starts.length - 1;
+    sl.fill(0); sr.fill(0); sl.set(L.subarray(st, st + len)); sr.set(R.subarray(st, st + len));
     const inp = prepareModelInput(sl, sr);
     const mix = new ort.Tensor('float32', inp.waveform, [1, 2, T]), mag = new ort.Tensor('float32', inp.magSpec, [1, 4, 2048, 336]);
-    const win = Float32Array.from({ length: len }, (_, i) => Math.min(i / (stride / 2), (len - i) / (stride / 2), 1));
-    for (const [s, sess] of ft.entries()) {
-      const r = await sess.run({ [sess.inputNames[0]]: mix, [sess.inputNames[1]]: mag });
+    // crossfade only where segments overlap, not at the very start/end of the track
+    const win = Float32Array.from({ length: len }, (_, i) => Math.min(st ? i / fade : 1, last ? 1 : (len - i) / fade, 1));
+    for (const [m, ss] of sess.entries()) {
+      const r = await ss.run({ [ss.inputNames[0]]: mix, [ss.inputNames[1]]: mag });
       let freq, time, ts;
-      for (const k of sess.outputNames) {
+      for (const k of ss.outputNames) {
         const d = r[k].dims;
         if (d.length == 5) freq = r[k].data; else if (d.length == 4) { time = r[k].data; ts = d[3]; }
       }
-      const fo = standaloneIspec(standaloneMask(freq)[s], T);
-      for (let i = 0; i < len; i++) {
-        out[s].left[start + i] += (time[s * 2 * ts + i] + (fo.left[i] || 0)) * win[i];
-        out[s].right[start + i] += (time[s * 2 * ts + ts + i] + (fo.right[i] || 0)) * win[i];
-        if (!s) w[start + i] += win[i];
+      const masks = standaloneMask(freq);
+      for (const k of ft ? [m] : [0, 1, 2, 3]) {
+        const fo = standaloneIspec(masks[k], T);
+        for (let i = 0; i < len; i++) {
+          out[k].left[st + i] += (time[k * 2 * ts + i] + (fo.left[i] || 0)) * win[i];
+          out[k].right[st + i] += (time[k * 2 * ts + ts + i] + (fo.right[i] || 0)) * win[i];
+        }
       }
-      say(`splitting (high quality) ${((si * 4 + s + 1) / (starts.length * 4) * 100).toFixed(0)}%`);
+      const done = si * sess.length + m + 1, all = starts.length * sess.length, el = (performance.now() - t0) / 1000;
+      say(`splitting ${(done / all * 100).toFixed(0)}% · ${el.toFixed(0)}s elapsed, ~${(el / done * (all - done)).toFixed(0)}s left`, done / all);
     }
+    for (let i = 0; i < len; i++) w[st + i] += win[i];
   }
   for (const o of out) for (let i = 0; i < n; i++) { const d = w[i] || 1e-8; o.left[i] /= d; o.right[i] /= d; }
-  return Object.fromEntries(STEMS.map((s, i) => [s, out[i]]));
+  return Object.fromEntries(STEMS.map((k, i) => [k, out[i]]));
 }
 
-// Standard quality: single htdemucs model (~172MB), works on WASM too.
-async function splitBase(L, R) {
-  if (!base) {
-    base = new DemucsProcessor({
-      ort,
-      onDownloadProgress: (l, t) => say(`downloading model ${(l / t * 100).toFixed(0)}% (~170MB)`),
-      onProgress: ({ progress }) => say(`splitting ${(progress * 100).toFixed(0)}%`)
-    });
-    await base.loadModel(CONSTANTS.DEFAULT_MODEL_URL);
+// ================= Lightning split (pure DSP, no model) =================
+// STFT -> harmonic/percussive split (smoothing masks) -> drums = percussive, bass = low harmonic,
+// vocals = mid-range centre-panned harmonic, other = whatever is left. Approximate, but near-instant.
+const N = 2048, HOP = N / 2, B = N / 2 + 1;
+const win = Float32Array.from({ length: N }, (_, i) => Math.sqrt(.5 - .5 * Math.cos(2 * Math.PI * i / N))); // sqrt-hann: perfect reconstruction at 50% overlap
+const rev = new Uint16Array(N); for (let i = 1; i < N; i++) rev[i] = (rev[i >> 1] >> 1) | ((i & 1) << 10);
+const ct = Float32Array.from({ length: N / 2 }, (_, k) => Math.cos(2 * Math.PI * k / N)), st = Float32Array.from({ length: N / 2 }, (_, k) => Math.sin(2 * Math.PI * k / N));
+function fft(re, im) {
+  for (let i = 0; i < N; i++) { const j = rev[i]; if (j > i) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; } }
+  for (let len = 2; len <= N; len <<= 1) {
+    const h = len >> 1, step = N / len;
+    for (let i = 0; i < N; i += len) for (let j = 0, k = 0; j < h; j++, k += step) {
+      const a = i + j, b = a + h, wr = ct[k], wi = -st[k], xr = re[b] * wr - im[b] * wi, xi = re[b] * wi + im[b] * wr;
+      re[b] = re[a] - xr; im[b] = im[a] - xi; re[a] += xr; im[a] += xi;
+    }
   }
-  return base.separate(L, R);
+}
+const fr = new Float32Array(N), fi = new Float32Array(N);
+function stft(x, F, Xr, Xi) {
+  for (let t = 0; t < F; t++) {
+    const p = t * HOP - HOP; fr.fill(0); fi.fill(0);
+    for (let i = 0; i < N; i++) { const j = p + i; if (j >= 0 && j < x.length) fr[i] = x[j] * win[i]; }
+    fft(fr, fi); Xr.set(fr.subarray(0, B), t * B); Xi.set(fi.subarray(0, B), t * B);
+  }
+}
+function istftFrame(Xr, Xi, o, m, out, p) { // add one masked frame into out at sample p
+  for (let k = 0; k < B; k++) { fr[k] = Xr[o + k] * m[k]; fi[k] = Xi[o + k] * m[k]; }
+  fi[0] = fi[N / 2] = 0;
+  for (let k = 1; k < N / 2; k++) { fr[N - k] = fr[k]; fi[N - k] = -fi[k]; }
+  fft(fi, fr); // swapped args = inverse FFT; real part lands in fr
+  for (let i = 0; i < N; i++) { const j = p + i; if (j >= 0 && j < out.length) out[j] += fr[i] * win[i] / N; }
+}
+function dspChunk(L, R) {
+  const n = L.length, F = Math.ceil(n / HOP) + 1, S = F * B, A = () => new Float32Array(S);
+  const [Lr, Li, Rr, Ri, M, Hm, Pm] = [A(), A(), A(), A(), A(), A(), A()];
+  stft(L, F, Lr, Li); stft(R, F, Rr, Ri);
+  for (let i = 0; i < S; i++) M[i] = (Math.hypot(Lr[i], Li[i]) + Math.hypot(Rr[i], Ri[i])) / 2;
+  for (let t = 0; t < F; t++) {
+    const a = Math.max(0, t - 4), b = Math.min(F - 1, t + 4);
+    for (let k = 0; k < B; k++) { let sum = 0; for (let u = a; u <= b; u++) sum += M[u * B + k]; Hm[t * B + k] = sum / (b - a + 1); } // smooth over time -> harmonic
+    for (let k = 0; k < B; k++) { const c = Math.max(0, k - 8), d = Math.min(B - 1, k + 8); let sum = 0; for (let u = c; u <= d; u++) sum += M[t * B + u]; Pm[t * B + k] = sum / (d - c + 1); } // over frequency -> percussive
+  }
+  const out = [0, 1, 2].map(() => [new Float32Array(n), new Float32Array(n)]);
+  const md = new Float32Array(B), mb = new Float32Array(B), mv = new Float32Array(B);
+  for (let t = 0; t < F; t++) {
+    const o = t * B;
+    for (let k = 0; k < B; k++) {
+      const h = Hm[o + k] ** 2, p = Pm[o + k] ** 2, mp = p / (p + h + 1e-12), f = k * SR / N;
+      const bw = f < 100 ? 1 : f < 220 ? (220 - f) / 120 : 0;                                  // bass band
+      const vb = f < 150 ? 0 : f < 300 ? (f - 150) / 150 : f < 5000 ? 1 : f < 8000 ? (8000 - f) / 3000 : 0; // vocal band
+      const mid = (Lr[o + k] + Rr[o + k]) ** 2 + (Li[o + k] + Ri[o + k]) ** 2, side = (Lr[o + k] - Rr[o + k]) ** 2 + (Li[o + k] - Ri[o + k]) ** 2;
+      const c = mid / (mid + side + 1e-12);                                                     // 1 = dead centre
+      md[k] = mp; mb[k] = (1 - mp) * bw; mv[k] = (1 - mp) * (1 - bw) * vb * c * c;
+    }
+    [md, mb, mv].forEach((m, k) => { istftFrame(Lr, Li, o, m, out[k][0], t * HOP - HOP); istftFrame(Rr, Ri, o, m, out[k][1], t * HOP - HOP); });
+  }
+  return out;
+}
+async function dspSplit(L, R) {
+  const n = L.length, C = SR * 30, O = SR * 2; // 30s chunks, 2s crossfade
+  const out = [0, 1, 2].map(() => [new Float32Array(n), new Float32Array(n)]);
+  for (let a = 0; a < n; a += C - O) {
+    const e = Math.min(a + C, n), last = e == n, r = dspChunk(L.subarray(a, e), R.subarray(a, e));
+    for (let k = 0; k < 3; k++) for (let c = 0; c < 2; c++) for (let i = 0; i < e - a; i++)
+      out[k][c][a + i] += r[k][c][i] * Math.min(a ? i / O : 1, last ? 1 : (e - a - i) / O, 1);
+    say('splitting…', e / n);
+    await new Promise(r => setTimeout(r)); // let the UI breathe
+    if (last) break;
+  }
+  const rest = (x, c) => x.map((v, i) => v - out[0][c][i] - out[1][c][i] - out[2][c][i]);
+  const pair = (k, o) => ({ left: o[k][0], right: o[k][1] });
+  return { drums: pair(0, out), bass: pair(1, out), vocals: pair(2, out), other: { left: rest(L, 0), right: rest(R, 1) } };
 }
 
-f.onchange = async () => {
-  const file = f.files[0];
-  if (!file) return;
+// ================= modes + loading =================
+const MODES = {
+  lightning: { name: '⚡ Lightning', note: 'Seconds · rough split · no download', urls: [] },
+  fast: { name: 'Fast', note: 'Standard AI model · ~170MB', urls: [BASE_URL], overlap: .1 },
+  high: { name: 'High', note: 'Fine-tuned AI ×4 · ~340MB · needs WebGPU', urls: STEMS.map(FT_URL), ft: true, overlap: .25, gpu: true },
+  best: { name: 'Best', note: 'High + extra overlap · slowest', urls: STEMS.map(FT_URL), ft: true, overlap: .5, gpu: true },
+};
+let mode = 'lightning'; try { mode = localStorage.mode; } catch {}
+if (!MODES[mode] || (MODES[mode].gpu && !gpu)) mode = gpu ? 'high' : 'fast';
+async function drawModes() {
+  const box = $('modes'); box.replaceChildren();
+  for (const [k, m] of Object.entries(MODES)) {
+    const b = document.createElement('button'), ready = await isCached(m.urls);
+    b.setAttribute('aria-pressed', k == mode); b.disabled = m.gpu && !gpu;
+    b.innerHTML = `<b>${m.name}<span class="tag ${ready ? '' : 'dl'}">${m.urls.length ? (ready ? '● ready' : '↓ download') : '● instant'}</span></b><small>${b.disabled ? 'Needs a WebGPU browser' : m.note}</small>`;
+    b.onclick = () => { mode = k; try { localStorage.mode = k; } catch {} drawModes(); };
+    box.append(b);
+  }
+}
+drawModes();
+
+let busy = false;
+async function load(file) {
+  if (busy || !file) return;
+  busy = true; $('pick').classList.add('busy');
+  const t0 = performance.now();
   try {
-    say('decoding...');
+    say('decoding…', 0);
     const song = await ctx.decodeAudioData(await file.arrayBuffer());
     const L = song.getChannelData(0), R = song.numberOfChannels > 1 ? song.getChannelData(1) : L;
-    let res;
-    if (navigator.gpu && await navigator.gpu.requestAdapter()) {
-      try { res = await splitFT(L, R); }
-      catch (e) { console.error(e); ft = null; say('high quality model failed (' + e.message + '), using standard model...'); }
+    let res, used = mode;
+    if (mode == 'lightning') res = await dspSplit(L, R);
+    else try { res = await mlSplit(MODES[mode], L, R); }
+    catch (e) {
+      if (mode == 'fast') throw e;
+      console.error(e); used = 'fast'; say(`${MODES[mode].name} failed (${e.message}), trying Fast…`);
+      res = await mlSplit(MODES.fast, L, R);
     }
-    res ??= await splitBase(L, R);
     setStems(STEMS.map(k => {
-      const b = ctx.createBuffer(2, res[k].left.length, ctx.sampleRate);
+      const b = ctx.createBuffer(2, res[k].left.length, SR);
       b.copyToChannel(res[k].left, 0); b.copyToChannel(res[k].right, 1);
       return b;
     }));
-    say(file.name + ' split into 4 stems');
-  } catch (e) { console.error(e); say('failed: ' + e.message); }
-};
+    ctx.resume();
+    say(`${file.name} · split with ${MODES[used].name.replace('⚡ ', '')} in ${((performance.now() - t0) / 1000).toFixed(1)}s`, 1);
+  } catch (e) { console.error(e); say('failed: ' + e.message, 0); }
+  busy = false; $('pick').classList.remove('busy'); f.value = ''; drawModes();
+}
+f.onchange = () => load(f.files[0]);
+addEventListener('dragover', e => { e.preventDefault(); document.body.classList.add('drag'); });
+addEventListener('dragleave', e => e.relatedTarget || document.body.classList.remove('drag'));
+addEventListener('drop', e => { e.preventDefault(); document.body.classList.remove('drag'); load(e.dataTransfer.files[0]); });
 
-setStems(synth());
-ctx.suspend().then(showIcon); // autoplay policy: start on first tap
+setStems(demo());
+say('Demo stems loaded · tap the centre to play, drag along each arc to set its level');
 </script>
